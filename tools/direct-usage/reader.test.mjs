@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { withDirect } from '../phone-deck/server.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -64,7 +65,7 @@ test('folders expose only the account uuid and plan, never the email or other se
   const { paths } = fixture();
   const folders = readFolders(paths.accountsDir);
   assert.deepEqual(folders.map((f) => Object.keys(f).sort()), [
-    ['accountUuid', 'folder', 'plan', 'rateLimitTier'], ['accountUuid', 'folder', 'plan', 'rateLimitTier'],
+    ['accountUuid', 'folder', 'organizationUuid', 'plan', 'rateLimitTier', 'team'], ['accountUuid', 'folder', 'organizationUuid', 'plan', 'rateLimitTier', 'team'],
   ]);
   assert.doesNotMatch(JSON.stringify(folders), /example\.test|not-for-output/);
 });
@@ -79,7 +80,7 @@ test('a rate-limit line becomes a weekly reading in percent with ISO times', () 
   const map = new Map([['claude-alpha', 'alpha']]);
   const line = t3Line('2026-11-19T18:57:57.588Z', 'claude-alpha', rateEvent(0.86));
   assert.deepEqual(readingsFromLine(line, map), [{
-    folder: 'alpha', accountUuid: null, entry: 'claude-alpha', source: 't3', scope: 'weekly', usedPercent: 86,
+    folder: 'alpha', accountUuid: null, organizationUuid: null, entry: 'claude-alpha', source: 't3', scope: 'weekly', usedPercent: 86,
     resetsAt: '2026-11-25T08:00:00.000Z', status: 'allowed', observedAt: '2026-11-19T18:57:57.588Z',
   }]);
   // An unmapped entry (the retired pool) yields nothing; other lines are not readings.
@@ -225,4 +226,105 @@ test('the history cap never drops a quiet account\'s latest reading', () => {
   const out = collect({ paths, now: NOW });
   assert.ok(out.readings.some((r) => r.folder === 'alpha' && r.usedPercent === 30));
   assert.equal(out.readings.length, MAX_READINGS + 1);
+});
+
+// #859 — the Studio and the Linux box, 2026-11-20: Tim's personal Insight plan
+// (folder insight) and his seat on Insight's Claude Team plan (folder
+// insight-team) share one account id; only the organization differs.
+// TRIPWIRE direct-readings-keep-plans-apart: neither folder's readings may
+// ever land on the other, and an older reading with no organization is
+// dropped while the account id is shared.
+test('TRIPWIRE direct-readings-keep-plans-apart: one account id, two organizations, no mixing', () => {
+  const { paths, log } = fixture();
+  const write = (name, org, type) => fs.writeFileSync(path.join(paths.accountsDir, name, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: 'uuid-shared', organizationUuid: org, organizationType: type, planDisplayName: type === 'claude_team' ? null : 'Max' },
+  }));
+  write('alpha', 'org-personal', 'claude_max');
+  write('beta', 'org-team', 'claude_team');
+  log('events.a.log', [t3Line('2026-11-19T18:57:57.000Z', 'claude-alpha', rateEvent(0.10))]);
+  log('events.b.log', [t3Line('2026-11-19T18:58:57.000Z', 'claude-beta', rateEvent(0.70))]);
+  const out = collect({ paths, now: NOW });
+  assert.deepEqual(out.folders.map((f) => [f.folder, f.organizationUuid, f.team]), [['alpha', 'org-personal', false], ['beta', 'org-team', true]]);
+  assert.deepEqual(out.readings.map((r) => [r.folder, r.organizationUuid, r.usedPercent]), [['alpha', 'org-personal', 10], ['beta', 'org-team', 70]]);
+  // The personal folder signs in to the Team seat: its earlier reading goes.
+  write('alpha', 'org-team', 'claude_team');
+  assert.deepEqual(collect({ paths, now: NOW }).readings.map((r) => [r.folder, r.usedPercent]), [['beta', 70]]);
+});
+
+// #862: readings saved before readings carried an organization stay on their own
+// folder when another folder starts sharing the account id (the Insight card
+// went empty when insight-team appeared), and never show on the other folder.
+test('TRIPWIRE older readings stay on their own folder when a Team folder shares the account id', () => {
+  const { paths, log } = fixture();
+  const write = (name, org, type) => fs.writeFileSync(path.join(paths.accountsDir, name, '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: 'uuid-shared', organizationUuid: org, organizationType: type },
+  }));
+  write('alpha', 'org-personal', 'claude_max');
+  write('beta', 'org-personal-other', 'claude_max');
+  collect({ paths, now: NOW });
+  const cache = JSON.parse(fs.readFileSync(paths.cacheFile, 'utf8'));
+  cache.readings.push({ folder: 'alpha', accountUuid: 'uuid-shared', entry: 'claude-alpha', source: 't3', scope: 'weekly', usedPercent: 50, resetsAt: null, status: null, observedAt: new Date(NOW - 60_000).toISOString() });
+  fs.writeFileSync(paths.cacheFile, JSON.stringify(cache));
+  write('beta', 'org-team', 'claude_team'); // the Team seat's folder
+  const out = collect({ paths, now: NOW + 1_000 });
+  assert.deepEqual(out.readings.filter((r) => r.usedPercent === 50).map((r) => r.folder), ['alpha']);
+});
+
+// #859 review: the folder moves from the personal plan to the Team seat before
+// the run that first reads an event from before the move. That event must not
+// be credited to the Team organization.
+test('an event from before a folder changed organization is not credited to the new one', () => {
+  const { paths, log } = fixture();
+  const write = (org, type) => fs.writeFileSync(path.join(paths.accountsDir, 'alpha', '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: 'uuid-alpha', organizationUuid: org, organizationType: type },
+  }));
+  write('org-personal', 'claude_max');
+  collect({ paths, now: NOW }); // remembers alpha's organization
+  write('org-team', 'claude_team');
+  log('events.late.log', [t3Line(new Date(NOW - 60_000).toISOString(), 'claude-alpha', rateEvent(0.42))]);
+  const out = collect({ paths, now: NOW + 3_600_000 });
+  assert.deepEqual(out.readings.filter((r) => r.folder === 'alpha'), []);
+  // An event after the change is credited normally.
+  log('events.after.log', [t3Line(new Date(NOW + 3_700_000).toISOString(), 'claude-alpha', rateEvent(0.05))]);
+  assert.deepEqual(collect({ paths, now: NOW + 3_800_000 }).readings.filter((r) => r.folder === 'alpha').map((r) => [r.organizationUuid, r.usedPercent]), [['org-team', 5]]);
+});
+
+// #859 review: a cached reading with no organization (from before readings
+// carried one) stays while the folder keeps its organization, and goes once the
+// folder changes organization after it.
+test('an older reading with no organization goes once its folder changes organization', () => {
+  const { paths } = fixture();
+  const write = (org, type) => fs.writeFileSync(path.join(paths.accountsDir, 'alpha', '.claude.json'), JSON.stringify({
+    oauthAccount: { accountUuid: 'uuid-alpha', organizationUuid: org, organizationType: type },
+  }));
+  write('org-personal', 'claude_max');
+  collect({ paths, now: NOW });
+  const cache = JSON.parse(fs.readFileSync(paths.cacheFile, 'utf8'));
+  cache.readings.push({ folder: 'alpha', accountUuid: 'uuid-alpha', entry: 'claude-alpha', source: 't3', scope: 'weekly', usedPercent: 33, resetsAt: null, status: null, observedAt: new Date(NOW - 60_000).toISOString() });
+  fs.writeFileSync(paths.cacheFile, JSON.stringify(cache));
+  assert.deepEqual(collect({ paths, now: NOW + 1_000 }).readings.filter((r) => r.folder === 'alpha').map((r) => r.usedPercent), [33], 'unchanged organization keeps it');
+  write('org-team', 'claude_team');
+  assert.deepEqual(collect({ paths, now: NOW + 3_600_000 }).readings.filter((r) => r.folder === 'alpha'), [], 'gone after the change');
+});
+
+// #866 TRIPWIRE fable-week-from-t3: the pair Claude Code's own /usage screen
+// confirmed on 2026-11-20 (medved1971, "Current week (all models)" 21% and
+// "Current week (Fable)" 30%) against T3's rate_limit_event a minute earlier
+// (seven_day 0.21, seven_day_overage_included 0.30). If Anthropic renames or
+// re-means the undocumented field, compare /usage again and update this.
+test('TRIPWIRE fable-week-from-t3: the second weekly window becomes the Fable weekly, marked unconfirmed', () => {
+  const { paths, log } = fixture();
+  log('events.f.log', [t3Line('2026-11-20T23:30:27.000Z', 'claude-alpha', rateEvent(0.21, {
+    unifiedWindows: {
+      seven_day: { utilization: 0.21, resetsAt: 1795356000, status: 'allowed' },
+      seven_day_overage_included: { utilization: 0.30, resetsAt: 1795356000, status: 'allowed' },
+    },
+  }))]);
+  const out = collect({ paths, now: NOW + 86_400_000 });
+  assert.deepEqual(out.readings.map((r) => [r.scope, r.usedPercent, r.unconfirmed ?? false, r.resetsAt]), [
+    ['weekly', 21, false, '2026-11-22T14:00:00.000Z'],
+    ['Fable weekly', 30, true, '2026-11-22T14:00:00.000Z'],
+  ]);
+  const deck = withDirect({ accounts: [], usage: [] }, out);
+  assert.deepEqual(deck.usage.map((u) => [u.scope, u.detail]), [['weekly', {}], ['Fable weekly', { unconfirmed: true }]]);
 });

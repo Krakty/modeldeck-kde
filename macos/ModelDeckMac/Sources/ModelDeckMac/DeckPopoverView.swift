@@ -976,6 +976,10 @@ struct DeckPopoverView: View {
                         .opacity(deckModel.isRowDimmedForPeek(row)
                             ? DeckPopoverModel.peekDimmedOpacity : 1)
                     }
+                    // Issue #868: page cards this Mac has no account for.
+                    ForEach(deckModel.columns(for: state).flatMap(\.pageCards)) { card in
+                        DeckPageCardRowView(card: card, showsProviderMark: true)
+                    }
                 }
             }
         } else {
@@ -1769,6 +1773,104 @@ struct DeckColumnView: View {
                     .opacity(deckModel.isRowDimmedForPeek(row)
                         ? DeckPopoverModel.peekDimmedOpacity : 1)
                 }
+            }
+            // Issue #868: page cards this Mac has no account for.
+            ForEach(column.pageCards) { card in
+                DeckPageCardRowView(card: card, showsProviderMark: false)
+            }
+        }
+    }
+}
+
+/// Issue #868: a read-only card for a usage-page account this Mac has no
+/// account for (a Team seat, another machine's folder). Laid out like an
+/// account card: provider mark, name and tier, one lead line with its
+/// percent, and every line once clicked. No buttons.
+struct DeckPageCardRowView: View {
+    let card: DeckPageCardRow
+    let showsProviderMark: Bool
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    if showsProviderMark, let provider = card.provider {
+                        ProviderMarkView(provider: provider, size: 13)
+                    }
+                    titleText
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if !isExpanded, let lead = card.lead, let value = lead.valueText {
+                        Text(value)
+                            .font(DeckType.value)
+                            .foregroundStyle(valueColor(for: lead))
+                            .monospacedDigit()
+                    }
+                }
+                if !isExpanded, let lead = card.lead {
+                    windowCaption(lead, showsValue: false)
+                    UsageBarView(window: lead)
+                }
+            }
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(card.windows) { window in
+                        VStack(alignment: .leading, spacing: 5) {
+                            windowCaption(window, showsValue: true)
+                            UsageBarView(window: window)
+                        }
+                    }
+                }
+            }
+            Text(card.sourceText)
+                .font(DeckType.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(9)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.black.opacity(0.13))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { isExpanded.toggle() }
+        // One VoiceOver element like an account card, read as its text in
+        // order; its default action opens and closes it (#869 review).
+        .accessibilityElement(children: .combine)
+        .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
+        .accessibilityAction { isExpanded.toggle() }
+    }
+
+    /// "insight-team · Team", the tier muted like an account card's plan.
+    private var titleText: Text {
+        let name = Text(card.label).font(DeckType.name)
+        guard card.team else { return name }
+        return name + Text(" · Team").font(DeckType.tier).foregroundStyle(.secondary)
+    }
+
+    private func windowCaption(_ window: DeckWindow, showsValue: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(window.title)
+                .font(DeckType.caption)
+                .foregroundStyle(showsValue ? .primary : .secondary)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if let reset = window.displayedResetText {
+                Text(reset)
+                    .font(DeckType.caption)
+                    .foregroundStyle(.secondary)
+                    .help(window.resetTooltip)
+            }
+            if showsValue {
+                Text(window.valueText ?? "—")
+                    .font(DeckType.value)
+                    .foregroundStyle(valueColor(for: window))
+                    .monospacedDigit()
             }
         }
     }

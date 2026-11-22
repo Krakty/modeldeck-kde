@@ -49,9 +49,16 @@ export function windowsOf(payload) {
 }
 
 function accountUuid(accountsDir, folder) {
+  return accountOf(accountsDir, folder)?.accountUuid ?? null;
+}
+
+// The folder's account id and, #859, its organization (a Team seat shares the
+// account id of the same person's personal plan).
+function accountOf(accountsDir, folder) {
   try {
-    const uuid = JSON.parse(fs.readFileSync(path.join(accountsDir, folder, '.claude.json'), 'utf8'))?.oauthAccount?.accountUuid;
-    return typeof uuid === 'string' ? uuid : null;
+    const oauth = JSON.parse(fs.readFileSync(path.join(accountsDir, folder, '.claude.json'), 'utf8'))?.oauthAccount;
+    if (typeof oauth?.accountUuid !== 'string') return null;
+    return { accountUuid: oauth.accountUuid, organizationUuid: typeof oauth.organizationUuid === 'string' ? oauth.organizationUuid : null };
   } catch { return null; }
 }
 
@@ -74,8 +81,9 @@ export function capture(target, payload, { paths = capturePaths(), now = Date.no
   const { folder, dir } = where;
   const windows = windowsOf(payload);
   if (!windows) return false;
-  const uuid = dir ? accountUuid(path.dirname(dir), path.basename(dir)) : accountUuid(paths.accountsDir, folder);
-  if (!uuid) return false;
+  const who = dir ? accountOf(path.dirname(dir), path.basename(dir)) : accountOf(paths.accountsDir, folder);
+  if (!who) return false;
+  const uuid = who.accountUuid;
   const file = path.join(paths.terminalDir, `${folder}.json`);
   // #853 review: an accounts folder always owns its name. A path capture never
   // takes over a name an accounts folder or another path holds; a capture for
@@ -85,12 +93,13 @@ export function capture(target, payload, { paths = capturePaths(), now = Date.no
     const prev = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (dir && (prev?.dir ?? null) !== dir) return false;
     // A status line runs often; the same numbers need saving once a minute.
-    if (prev?.accountUuid === uuid && JSON.stringify(prev.windows) === JSON.stringify(windows)
+    if (prev?.accountUuid === uuid && (prev.organizationUuid ?? null) === who.organizationUuid
+      && JSON.stringify(prev.windows) === JSON.stringify(windows)
       && now - Date.parse(prev.observedAt) < SAME_FOR_MS) return false;
   } catch { /* first capture */ }
   fs.mkdirSync(paths.terminalDir, { recursive: true, mode: 0o700 });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ v: CAPTURE_VERSION, folder, ...(dir ? { dir } : {}), accountUuid: uuid, observedAt: new Date(now).toISOString(), windows }), { mode: 0o600 });
+  fs.writeFileSync(tmp, JSON.stringify({ v: CAPTURE_VERSION, folder, ...(dir ? { dir } : {}), accountUuid: uuid, organizationUuid: who.organizationUuid, observedAt: new Date(now).toISOString(), windows }), { mode: 0o600 });
   fs.renameSync(tmp, file);
   return true;
 }

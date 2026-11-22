@@ -756,10 +756,33 @@ public struct UsageSnapshotDetail: Codable, Equatable, Sendable {
     /// (src/adapters/claude.mjs `parseClaudeSpendAmounts`). Optional end to
     /// end — older daemons and providers without amounts decode unchanged.
     public var spend: SpendAmounts?
+    /// Issue #866: the reading came from an undocumented Claude Code field
+    /// (the Fable weekly), so the deck labels it "unconfirmed".
+    public var unconfirmed: Bool?
 
-    public init(windowDurationMins: Double? = nil, spend: SpendAmounts? = nil) {
+    public init(windowDurationMins: Double? = nil, spend: SpendAmounts? = nil, unconfirmed: Bool? = nil) {
         self.windowDurationMins = windowDurationMins
         self.spend = spend
+        self.unconfirmed = unconfirmed
+    }
+}
+
+/// Issue #868: a usage-page card no account on this Mac matches (a Team
+/// seat, another machine's folder). Read-only: its id matches no account,
+/// and it carries usage rows only. Absent from older daemons.
+public struct DeckPageCard: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var provider: String
+    public var label: String
+    public var team: Bool?
+    public var usage: [UsageSnapshot]
+
+    public init(id: String, provider: String, label: String, team: Bool? = nil, usage: [UsageSnapshot] = []) {
+        self.id = id
+        self.provider = provider
+        self.label = label
+        self.team = team
+        self.usage = usage
     }
 }
 
@@ -1158,6 +1181,8 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// host's usage page. Same tolerant contract as the fields above; read
     /// the role through `proxyRole`.
     public var proxy: DeckProxyStatus?
+    /// Issue #868: page cards this Mac has no account for.
+    public var pageCards: [DeckPageCard]
 
     public init(
         accounts: [DeckAccount] = [],
@@ -1171,8 +1196,10 @@ public struct DeckState: Codable, Equatable, Sendable {
         codexProfilesMigration: CodexProfilesMigration? = nil,
         managed: [String: Bool]? = nil,
         managementBlocked: [String: String]? = nil,
-        proxy: DeckProxyStatus? = nil
+        proxy: DeckProxyStatus? = nil,
+        pageCards: [DeckPageCard] = []
     ) {
+        self.pageCards = pageCards
         self.managed = managed
         self.managementBlocked = managementBlocked
         self.accounts = accounts
@@ -1189,7 +1216,7 @@ public struct DeckState: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case managed, managementBlocked, accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
-        case codexProfilesMigration, proxy
+        case codexProfilesMigration, proxy, pageCards
     }
 
     public init(from decoder: Decoder) throws {
@@ -1209,6 +1236,7 @@ public struct DeckState: Codable, Equatable, Sendable {
             forKey: .codexProfilesMigration
         )
         self.proxy = try? container.decodeIfPresent(DeckProxyStatus.self, forKey: .proxy)
+        self.pageCards = (try? container.decodeIfPresent([DeckPageCard].self, forKey: .pageCards)) ?? []
     }
 
     /// Issue #784: a daemon that omits `proxy` (pre-#784), or sends a block

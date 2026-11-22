@@ -770,28 +770,72 @@ function parsePoolHubRecord(pool) {
 }
 
 /// Issue #836: validate the usage page's `usage` block into
-/// `{ readAt, windows: Map<tag, windows | null> }`. A tag two cards list maps
-/// to null so it matches nobody. Throws on any malformed field.
+/// `{ readAt, windows: Map<tag, windows | null>, cards }`. A tag two cards list
+/// maps to null so it matches nobody. `cards` keeps each card's name and Team
+/// flag for the page-only cards (#868). Throws on any malformed field.
 function parsePoolHubUsage(usage) {
   const invalid = () => { throw new Error('invalid hub usage'); };
   if (!usage || typeof usage !== 'object' || !isIso8601Timestamp(usage.readAt)
     || !Array.isArray(usage.accounts) || usage.accounts.length > 200) invalid();
   const byTag = new Map();
+  const cards = [];
   for (const entry of usage.accounts) {
     if (!entry || !Array.isArray(entry.matches) || !entry.matches.length || entry.matches.length > 8
       || !entry.matches.every((tag) => typeof tag === 'string' && /^[0-9a-f]{24}$/.test(tag))
-      || !Array.isArray(entry.windows) || entry.windows.length > 12) invalid();
+      || !Array.isArray(entry.windows) || entry.windows.length > 12
+      || !(entry.label === undefined || (typeof entry.label === 'string' && entry.label.trim() && [...entry.label].length <= 64
+        && !entry.label.includes('@')))
+      || !(entry.team === undefined || typeof entry.team === 'boolean')) invalid();
     const windows = entry.windows.map((w) => {
       if (!w || typeof w.scope !== 'string' || !w.scope.trim() || w.scope.length > 64
         || typeof w.usedPercent !== 'number' || !(w.usedPercent >= 0 && w.usedPercent <= 100)
         || !(w.resetsAt === null || isIso8601Timestamp(w.resetsAt))
         || !isIso8601Timestamp(w.observedAt)
         || !(w.source === null || (typeof w.source === 'string' && w.source.length <= 64))) invalid();
-      return { scope: w.scope, usedPercent: w.usedPercent, resetsAt: w.resetsAt, observedAt: w.observedAt, source: w.source };
+      return { scope: w.scope, usedPercent: w.usedPercent, resetsAt: w.resetsAt, observedAt: w.observedAt, source: w.source,
+        ...(w.unconfirmed === true ? { unconfirmed: true } : {}) };
     });
     for (const tag of new Set(entry.matches)) byTag.set(tag, byTag.has(tag) ? null : windows);
+    cards.push({ matches: [...new Set(entry.matches)], label: entry.label?.trim() ?? null, team: entry.team === true, windows });
   }
-  return { readAt: Date.parse(usage.readAt), windows: byTag };
+  return { readAt: Date.parse(usage.readAt), windows: byTag, cards };
+}
+
+/// One page window as a usage row: the page's reading, named by its source
+/// ("Studio · T3") and keeping its "unconfirmed" mark (#866).
+function poolHubRow(accountId, scope, w) {
+  return {
+    accountId, scope, usedPercent: w.usedPercent, remainingPercent: Math.round((100 - w.usedPercent) * 10) / 10,
+    resetsAt: w.resetsAt, observedAt: w.observedAt, source: 'pool-hub', stale: false,
+    detail: w.unconfirmed ? { unconfirmed: true } : {},
+    ...(w.source ? { hubSource: w.source } : {}),
+  };
+}
+
+/// The page card a Claude account here takes its numbers from, or null.
+/// Two different cards, or a tag the page lists twice, match nothing.
+function poolHubMatch(hub, account) {
+  if (account.provider !== 'claude') return null;
+  const found = new Set(claudeUsageTags(account.identity, account.metadata?.claudeAccountUuid)
+    .filter((tag) => hub.windows.has(tag)).map((tag) => hub.windows.get(tag)));
+  return found.size === 1 && !found.has(null) ? [...found][0] : null;
+}
+
+/// #868, the page's rule from #864 with the page's boundaries: when an
+/// account's newest reading is at most 6 hours old, drop its windows read
+/// more than 6 hours before it. An all-old account keeps every window; its
+/// age line says how old.
+const LEFT_BEHIND_MS = 6 * 3_600_000;
+function dropLeftBehind(rows, now) {
+  const newest = new Map();
+  for (const row of rows) {
+    const at = Date.parse(row.observedAt);
+    if (at > (newest.get(row.accountId) ?? -Infinity)) newest.set(row.accountId, at);
+  }
+  return rows.filter((row) => {
+    const top = newest.get(row.accountId);
+    return !(now - top <= LEFT_BEHIND_MS && top - Date.parse(row.observedAt) > LEFT_BEHIND_MS);
+  });
 }
 
 /// Issue #836 review: one key for the spellings of the same window, as the
@@ -1923,19 +1967,46 @@ export class ModelDeckService {
   /// only when it is newer. Same freshness rule as the pool record; the match
   /// is a tag of the email or the Claude account id, never the label. Rows
   /// from the page carry `source: 'pool-hub'` and the page's own source name.
-  withPoolHubUsage(usage, accounts) {
+  /// The page's usage block while it is fresh and from the hub this Mac
+  /// uses, else null.
+  freshPoolHubUsage() {
     const settings = this.store.getSettings();
     const hub = this.poolHubUsage;
     if (!hub || !this.proxyRoleRemote(settings) || !settings.poolHubUrl || settings.poolHubUrl !== this.poolHubUrl
-      || this.poolHubStatus.lastReadOk !== true || this.now() - hub.readAt >= POOL_HUB_FRESH_MS) return usage;
+      || this.poolHubStatus.lastReadOk !== true || this.now() - hub.readAt >= POOL_HUB_FRESH_MS) return null;
+    return hub;
+  }
+
+  /// #868: the page cards no account on this Mac matches (a Team seat,
+  /// another machine's folder), so the deck lists every card the page has.
+  /// Read-only: an id no store lookup can find, and usage rows only.
+  poolHubPageCards(accounts) {
+    const hub = this.freshPoolHubUsage();
+    if (!hub?.cards) return [];
+    // A card stays listed unless an account here takes its numbers; one the
+    // match skips as ambiguous would otherwise show nowhere (#869 review).
+    const matched = new Set(accounts.map((a) => poolHubMatch(hub, a)).filter(Boolean));
+    // Two cards can share a first tag (#869 review); a suffix keeps ids unique.
+    const ids = new Set();
+    return hub.cards.filter((card) => !matched.has(card.windows)).map((card) => {
+      const base = `page:${card.matches[0].slice(0, 12)}`;
+      let id = base;
+      for (let n = 2; ids.has(id); n++) id = `${base}:${n}`;
+      ids.add(id);
+      const rows = card.windows.filter((w) => Date.parse(w.observedAt) <= this.now() + 5 * 60_000)
+        .map((w) => poolHubRow(id, w.scope, w));
+      return { id, provider: 'claude', label: card.label ?? 'Usage page card', team: card.team, usage: dropLeftBehind(rows, this.now()) };
+    });
+  }
+
+  withPoolHubUsage(usage, accounts) {
+    const hub = this.freshPoolHubUsage();
+    if (!hub) return usage;
     const rows = [...usage];
     for (const account of accounts) {
-      if (account.provider !== 'claude') continue;
-      const found = new Set(claudeUsageTags(account.identity, account.metadata?.claudeAccountUuid)
-        .filter((tag) => hub.windows.has(tag)).map((tag) => hub.windows.get(tag)));
-      // Two different cards, or a tag the page lists twice: match nothing.
-      if (found.size !== 1 || found.has(null)) continue;
-      for (const w of [...found][0]) {
+      const windows = poolHubMatch(hub, account);
+      if (!windows) continue;
+      for (const w of windows) {
         const observedAt = Date.parse(w.observedAt);
         if (observedAt > this.now() + 5 * 60_000) continue;
         // Spellings of one window ('week', 'weekly') are one row (#836 review).
@@ -1944,17 +2015,12 @@ export class ModelDeckService {
         // An equal reading is the page's copy of this Mac's own; take it so the
         // card names its source instead of the pool line (#847).
         if (index >= 0 && observedAt < Date.parse(rows[index].observedAt)) continue;
-        const row = {
-          accountId: account.id, scope: index >= 0 ? rows[index].scope : w.scope, usedPercent: w.usedPercent,
-          remainingPercent: Math.round((100 - w.usedPercent) * 10) / 10,
-          resetsAt: w.resetsAt, observedAt: w.observedAt, source: 'pool-hub', stale: false, detail: {},
-          ...(w.source ? { hubSource: w.source } : {}),
-        };
+        const row = poolHubRow(account.id, index >= 0 ? rows[index].scope : w.scope, w);
         if (index >= 0) rows[index] = row;
         else rows.push(row);
       }
     }
-    return rows;
+    return dropLeftBehind(rows, this.now());
   }
 
   recordPoolHubFailure(failed) {
@@ -7866,6 +7932,7 @@ export class ModelDeckService {
       ...value,
       accounts,
       usage: this.withPoolHubUsage(value.usage, accounts),
+      pageCards: this.poolHubPageCards(accounts),
       codexProfilesDir: this.codexProfilesDir,
       activation: { claude: claudeActivation, codex: codexActivation },
       managed: { claude: this.isProviderManaged('claude'), codex: this.isProviderManaged('codex') },

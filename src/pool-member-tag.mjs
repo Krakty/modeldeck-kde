@@ -42,7 +42,13 @@ export function poolMemberTag(provider, identity) {
 /// Issue #836: the tags a Claude account's usage travels under from the usage
 /// page to a remote Mac: its email and its Claude account id, each one-way.
 /// A Mac that never learned one of them still matches on the other.
-export function claudeUsageTags(identity, accountUuid) {
+export function claudeUsageTags(identity, accountUuid, teamOrganizationUuid = null) {
+  // #859: a Team seat shares the person's email and account id; its only tag
+  // carries the organization, so no personal-plan account ever matches it.
+  if (teamOrganizationUuid) {
+    return typeof accountUuid === 'string' && accountUuid.trim()
+      ? [poolMemberTag('claude', `uuid:${accountUuid}|org:${teamOrganizationUuid}`)].filter(Boolean) : [];
+  }
   const tags = [poolMemberTag('claude', identity)];
   if (typeof accountUuid === 'string' && accountUuid.trim()) tags.push(poolMemberTag('claude', `uuid:${accountUuid}`));
   return tags.filter(Boolean);

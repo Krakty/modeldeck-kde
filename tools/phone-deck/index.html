@@ -254,6 +254,7 @@ button { font: inherit; color: inherit; }
 .lims { display: grid; gap: 8px; }
 .lim { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; font-size: 12.5px; color: var(--ink-2); align-items: baseline; }
 .lim .pct { font-size: 12.5px; }
+.lim .unconf { font-size: 10px; opacity: .7; font-weight: normal; }
 .lim .bar { grid-column: 1 / -1; height: 4px; }
 .lim .when { grid-column: 1 / -1; color: var(--ink-3); font-size: 11.5px; margin-top: -1px; }
 .pace { position: relative; margin-top: 14px; font-size: 13px; color: var(--warn-ink); line-height: 1.35; }
@@ -692,7 +693,7 @@ function pickCard({ a, room }, p, now) {
   const lims = all.map((w) => {
     const r = ms(w.resetsAt);
     const when = w.state === 'unanchored' ? 'Starts on first use' : r && r > now ? `${r - now < DAY ? 'in ' + span(r - now) : whenPT(r, now)}` : '';
-    return `<div class="lim s-${w.severity}"><span>${esc(w.title)}</span><span class="pct">${pctNum(w)}%</span><div class="bar"><i style="width:${clamp(w.remaining, 0, 100)}%"></i></div>${when ? `<span class="when">${when}</span>` : ''}</div>`;
+    return `<div class="lim s-${w.severity}"><span>${esc(w.title)}${w.unconfirmed ? ' <small class="unconf" title="From an undocumented Claude Code field">unconfirmed</small>' : ''}</span><span class="pct">${pctNum(w)}%</span><div class="bar"><i style="width:${clamp(w.remaining, 0, 100)}%"></i></div>${when ? `<span class="when">${when}</span>` : ''}</div>`;
   }).join('');
   const stale = a.stale ? `<div class="pace" style="color:var(--ink-3)">Data from ${ago(ms(a.newestObservedAt), now)}</div>` : '';
   return `<article class="pick s-${sev}"><div class="pick-top"><div class="eyebrow">Best ${PROVIDERS[p].name} account right now</div>

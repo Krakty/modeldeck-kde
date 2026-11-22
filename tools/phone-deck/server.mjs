@@ -34,6 +34,7 @@ const STATE_TTL = 60_000;          // upstream state cache
 const FORECAST_TTL = 5 * 60_000;
 const HISTORY_TTL = 10 * 60_000;
 const M5_RETRY = 2 * 60_000;       // after a failed M5 read, wait this long before trying again
+const LEFT_BEHIND = 6 * 3_600_000; // #864: a window this much older than the card's newest is dropped
 const STALE_AFTER = 10 * 60_000;   // Mac app: 2x its 5-minute fallback refresh interval
 export const DOWN_AFTER = 5 * 60_000;     // one slow answer isn't "asleep": banner only after this long without a good read
 
@@ -205,8 +206,11 @@ export function withDirect(state, direct) {
   const accounts = [...(state?.accounts || [])];
   const usage = [...(state?.usage || [])];
   for (const f of direct.folders || []) {
-    const at = accounts.findIndex((a) => a.enabled && normProvider(a.provider) === 'claude'
-      && a.metadata?.claudeAccountUuid === f.accountUuid);
+    // #859: a Team seat shares its account id with the person's personal plan.
+    // ModelDeck's own accounts are personal plans, so a Team folder never
+    // joins one; it is its own card, keyed by account id and organization.
+    const at = f.team ? -1 : accounts.findIndex((a) => a.enabled && normProvider(a.provider) === 'claude'
+      && !a.metadata?.claudeTeamOrganizationUuid && a.metadata?.claudeAccountUuid === f.accountUuid);
     let id;
     if (at >= 0) {
       id = accounts[at].id;
@@ -215,12 +219,15 @@ export function withDirect(state, direct) {
       id = `direct:${f.folder}`;
       accounts.push({
         id, provider: 'claude', label: f.folder, enabled: true, directFolder: true,
-        metadata: { claudeAccountUuid: f.accountUuid, claudePlan: f.plan ? { displayName: f.plan } : null },
+        metadata: {
+          claudeAccountUuid: f.accountUuid, claudePlan: f.plan ? { displayName: f.plan } : null,
+          ...(f.team ? { claudeTeamOrganizationUuid: f.organizationUuid } : {}),
+        },
       });
     }
     for (const r of direct.readings || []) {
       if (r.folder !== f.folder) continue;
-      usage.push({ accountId: id, scope: r.scope, usedPercent: r.usedPercent, resetsAt: r.resetsAt, observedAt: r.observedAt, via: r.source === 'terminal' ? 'Terminal' : 'T3', detail: {} });
+      usage.push({ accountId: id, scope: r.scope, usedPercent: r.usedPercent, resetsAt: r.resetsAt, observedAt: r.observedAt, via: r.source === 'terminal' ? 'Terminal' : 'T3', detail: r.unconfirmed ? { unconfirmed: true } : {} });
     }
   }
   return { ...state, accounts, usage };
@@ -233,11 +240,14 @@ export function mergeAccounts(machines) {
     for (const a of m.state.accounts) {
       if (!a.enabled) continue;
       const provider = normProvider(a.provider);
-      const uuid = a.metadata?.claudeAccountUuid || null;
+      // #859: a Team seat's key carries its organization, so it never merges
+      // with the same person's personal plan (same account id).
+      const team = a.metadata?.claudeTeamOrganizationUuid || null;
+      const uuid = a.metadata?.claudeAccountUuid ? `${a.metadata.claudeAccountUuid}${team ? `|${team}` : ''}` : null;
       const norm = normLabel(a.label);
       const target = list.find((x) => x.provider === provider && !x.from.has(m.name)
-        && (uuid && x.uuids.size ? x.uuids.has(uuid) : x.norms.has(norm)));
-      const acct = target || { provider, label: a.label, color: a.color, uuids: new Set(), norms: new Set(), from: new Map() };
+        && (uuid && x.uuids.size ? x.uuids.has(uuid) : !team && !x.team && x.norms.has(norm)));
+      const acct = target || { provider, label: a.label, color: a.color, team: !!team, uuids: new Set(), norms: new Set(), from: new Map() };
       if (!target) list.push(acct);
       acct.from.set(m.name, a);
       if (uuid) acct.uuids.add(uuid);
@@ -303,6 +313,7 @@ export function buildAccount(acct, idx, now, machines) {
     const w = {
       scope: u.scope, rank: windowRank(u.scope), spend: isSpend(u.scope),
       remaining, resetsAt, spendText: isSpend(u.scope) ? spendText(u.detail?.spend) : null,
+      unconfirmed: u.detail?.unconfirmed === true,
     };
     if (hidden(w, acct.provider)) continue;
     windows.push({
@@ -311,7 +322,21 @@ export function buildAccount(acct, idx, now, machines) {
       severity: idle ? 'unknown' : severity(remaining),
     });
   }
+  // #864: with the token check off, a window no clean source reports (the
+  // per-model Fable weekly) keeps its last token reading for days. Next to a
+  // fresh weekly it looked current; a window this far behind the card's newest
+  // reading is left off the card.
   windows.sort((l, r) => (l.rank - r.rank) || l.scope.localeCompare(r.scope, 'en', { sensitivity: 'base' }));
+  // The weekly graph is chosen from every window, sorted, before any is left off.
+  const allWindows = [...windows];
+  const newestObs = Math.max(...windows.map((w) => w.observedAt));
+  // Only a card with a fresh reading drops the old ones; an all-old card keeps
+  // every window, and its age line says how old they are (#864 review).
+  if (now - newestObs <= LEFT_BEHIND) {
+    for (let i = windows.length - 1; i >= 0; i--) {
+      if (newestObs - windows[i].observedAt > LEFT_BEHIND) windows.splice(i, 1);
+    }
+  }
 
   // Claude cards lead with the all-models weekly, as Tim's Mac deck does (his
   // chosen lead window, #746); Codex cards, and Claude cards with no weekly,
@@ -343,7 +368,7 @@ export function buildAccount(acct, idx, now, machines) {
     }
   }
 
-  const weekly = windows.find((w) => w.rank === 1 && w.state === 'anchored' && w.resetsAt > now && w.duration);
+  const weekly = allWindows.find((w) => w.rank === 1 && w.state === 'anchored' && w.resetsAt > now && w.duration);
   return {
     out: {
       id: `a${idx + 1}`,
@@ -358,6 +383,7 @@ export function buildAccount(acct, idx, now, machines) {
       reads: true,
       windows: windows.map((w) => ({
         title: w.title, rank: w.rank, spend: w.spend, remaining: round1(w.remaining),
+        ...(w.unconfirmed ? { unconfirmed: true } : {}),
         resetsAt: iso(w.resetsAt), observedAt: iso(w.observedAt), source: w.src,
         state: w.state, rolledAt: iso(w.rolledAt), idleText: w.idleText, spendText: w.spendText,
         severity: w.severity,
@@ -390,14 +416,26 @@ export function buildAccount(acct, idx, now, machines) {
 function hubUsageOf(acct, windows) {
   const matches = new Set();
   for (const a of acct.from.values()) {
-    for (const tag of claudeUsageTags(a.identity, a.metadata?.claudeAccountUuid)) matches.add(tag);
+    const tags = a.metadata?.claudeTeamOrganizationUuid
+      ? claudeUsageTags(null, a.metadata.claudeAccountUuid, a.metadata.claudeTeamOrganizationUuid)
+      : claudeUsageTags(a.identity, a.metadata?.claudeAccountUuid);
+    for (const tag of tags) matches.add(tag);
   }
   const shown = windows.filter((w) => !w.spend && w.remaining != null);
   if (!matches.size || matches.size > 8 || !shown.length) return null;
+  // #868: the card's name and Team flag, so a Mac with no account for this
+  // card can still list it. A name that looks like an email stays home.
+  // The whole name is checked before the cut, so no part of an email goes out.
+  const fullLabel = typeof acct.label === 'string' ? acct.label.trim() : '';
+  // Cut by code point, so an emoji is never split in half (#869 review).
+  const label = fullLabel.includes('@') ? '' : [...fullLabel].slice(0, 64).join('');
   return {
     matches: [...matches],
+    ...(label ? { label } : {}),
+    ...(acct.team ? { team: true } : {}),
     windows: shown.slice(0, 12).map((w) => ({
       scope: w.scope, usedPercent: round1(100 - w.remaining), resetsAt: iso(w.resetsAt),
+      ...(w.unconfirmed ? { unconfirmed: true } : {}),
       observedAt: iso(w.observedAt), source: w.src,
     })),
   };

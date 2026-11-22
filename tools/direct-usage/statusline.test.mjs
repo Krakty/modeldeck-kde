@@ -48,7 +48,7 @@ test('capture saves the weekly and 5-hour numbers with the account uuid, once a 
   const file = path.join(paths.terminalDir, 'alpha.json');
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
   assert.deepEqual(saved, {
-    v: 1, folder: 'alpha', accountUuid: 'uuid-alpha', observedAt: new Date(NOW).toISOString(),
+    v: 1, folder: 'alpha', accountUuid: 'uuid-alpha', organizationUuid: null, observedAt: new Date(NOW).toISOString(),
     windows: { seven_day: { used_percentage: 12.5, resets_at: 1795593600 }, five_hour: { used_percentage: 3, resets_at: 1795000000 } },
   });
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);

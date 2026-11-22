@@ -26,10 +26,16 @@ export const READER_VERSION = 1;
 const DAY = 86_400_000;
 export const KEEP_MS = 8 * DAY;          // a weekly window plus a day
 export const MAX_READINGS = 4000;
+const UNATTRIBUTED = 'unattributed';
 const CHUNK = 8 * 1024 * 1024;
 const LINE_HEAD = /^\[([^\]]{10,40})\] [A-Z]{1,12}: /;
 const INSTANCE = /provider-instance:([A-Za-z0-9._-]{1,80})/;
-const WINDOWS = [['seven_day', 'weekly'], ['five_hour', '5-hour']];
+// #866 (Tim, 2026-11-21: "use it"): T3's undocumented second weekly window,
+// seven_day_overage_included, matches Claude Code's own /usage "Current week
+// (Fable)" (21% vs 30% on 2026-11-20). Saved as the Fable weekly, marked
+// unconfirmed because Anthropic does not document it.
+const WINDOWS = [['seven_day', 'weekly'], ['five_hour', '5-hour'], ['seven_day_overage_included', 'Fable weekly']];
+const UNCONFIRMED = new Set(['seven_day_overage_included']);
 
 export function defaultPaths(home = os.homedir(), env = process.env) {
   const t3 = env.MD_T3_USERDATA || path.join(home, '.t3', 'userdata');
@@ -69,6 +75,10 @@ function folderAccount(dir, folder) {
   return {
     folder,
     accountUuid: oauth.accountUuid,
+    // #859: one login can hold a personal plan and a Team seat (same account
+    // id, different organization); readings are kept apart by both.
+    organizationUuid: typeof oauth.organizationUuid === 'string' ? oauth.organizationUuid : null,
+    team: oauth.organizationType === 'claude_team',
     plan: typeof oauth.planDisplayName === 'string' ? oauth.planDisplayName : null,
     rateLimitTier: typeof oauth.organizationRateLimitTier === 'string' ? oauth.organizationRateLimitTier : null,
   };
@@ -120,7 +130,7 @@ const isoSec = (s) => {
 
 // One saved log line -> readings, or null when it is not a rate-limit event.
 // utilization is a fraction (0.86 = 86% used); resetsAt is epoch seconds.
-export function readingsFromLine(line, entryFolders, uuidOf = new Map()) {
+export function readingsFromLine(line, entryFolders, uuidOf = new Map(), orgOf = new Map(), orgSince = new Map()) {
   if (!line.includes('"rate_limit_event"')) return null;
   const head = LINE_HEAD.exec(line);
   if (!head) return null;
@@ -140,7 +150,11 @@ export function readingsFromLine(line, entryFolders, uuidOf = new Map()) {
     const used = finite(w?.utilization);
     if (used == null) continue;
     out.push({
-      folder, accountUuid: uuidOf.get(folder) ?? null, entry, source: 't3', scope,
+      // #859 review: an event from before the folder's organization last
+      // changed cannot be credited to the new one; it is left unattributed.
+      folder, accountUuid: uuidOf.get(folder) ?? null,
+      organizationUuid: observedMs < (orgSince.get(folder) ?? 0) ? UNATTRIBUTED : (orgOf.get(folder) ?? null),
+      entry, source: 't3', scope, ...(UNCONFIRMED.has(key) ? { unconfirmed: true } : {}),
       usedPercent: Math.round(used * 1000) / 10,
       resetsAt: isoSec(w.resetsAt),
       status: typeof w.status === 'string' ? w.status : null,
@@ -176,7 +190,7 @@ export function readTerminal(terminalDir) {
       const used = finite(c.windows?.[key]?.used_percentage);
       if (used == null || used < 0 || used > 100) continue;
       out.push({
-        folder: c.folder, accountUuid: c.accountUuid, entry: null, source: 'terminal', scope,
+        folder: c.folder, accountUuid: c.accountUuid, organizationUuid: typeof c.organizationUuid === 'string' ? c.organizationUuid : null, entry: null, source: 'terminal', scope,
         usedPercent: Math.round(used * 10) / 10,
         resetsAt: isoSec(c.windows[key].resets_at),
         status: null,
@@ -185,6 +199,19 @@ export function readTerminal(terminalDir) {
     }
   }
   return out;
+}
+
+// #859: a reading belongs to its folder's account AND organization, so a
+// personal plan and a Team seat never mix.
+export function belongs(r, folders, orgSince = new Map()) {
+  const f = folders.find((x) => x.folder === r.folder);
+  if (!f || !r.accountUuid || r.accountUuid !== f.accountUuid) return false;
+  if (r.organizationUuid != null) return r.organizationUuid === f.organizationUuid;
+  // A reading saved before readings carried an organization belongs to its own
+  // folder unless that folder changed organization after it (#862: dropping all
+  // of them whenever another folder shares the account id emptied the Insight
+  // card once the Team seat's folder appeared).
+  return !(Date.parse(r.observedAt) < (orgSince.get(r.folder) ?? 0));
 }
 
 function loadCache(file) {
@@ -233,6 +260,18 @@ export function collect({ paths = defaultPaths(), now = Date.now(), useCache = t
   const folders = readFolders(paths.accountsDir);
   folders.push(...captureFolders(paths.terminalDir, new Set(folders.map((f) => f.folder))));
   const uuidOf = new Map(folders.map((f) => [f.folder, f.accountUuid]));
+  const orgOf = new Map(folders.map((f) => [f.folder, f.organizationUuid]));
+  // #859 review: remember each folder's organization between runs; when it
+  // changes, events dated before the change are not credited to the new one.
+  // A reader with no saved state cannot see an earlier change (known limit).
+  cache.folderOrgs ||= {};
+  const orgSince = new Map();
+  for (const f of folders) {
+    const prev = cache.folderOrgs[f.folder];
+    if (prev && prev.org !== f.organizationUuid) cache.folderOrgs[f.folder] = { org: f.organizationUuid, since: now };
+    else if (!prev) cache.folderOrgs[f.folder] = { org: f.organizationUuid, since: 0 };
+    orgSince.set(f.folder, cache.folderOrgs[f.folder].since);
+  }
   const entryFolders = readEntryFolders(paths.t3Settings, paths.accountsDir);
   let logNames = [];
   let t3Logs = true;
@@ -251,7 +290,7 @@ export function collect({ paths = defaultPaths(), now = Date.now(), useCache = t
     if (st.size === offset) continue;
     try {
       const next = readNewLines(file, offset, st.size, (line) => {
-        const rs = readingsFromLine(line, entryFolders, uuidOf);
+        const rs = readingsFromLine(line, entryFolders, uuidOf, orgOf, orgSince);
         if (rs) {
           for (const r of rs) cache.readings.push(r);
           if (rs.length) (cache.activity[name] ||= { at: 0, folder: rs[0].folder, reading: 0 }).reading = Date.parse(rs[0].observedAt);
@@ -299,7 +338,7 @@ export function collect({ paths = defaultPaths(), now = Date.now(), useCache = t
     folders,
     // A folder signed in to another account since a reading drops that
     // reading: it belongs to the old account (#834 review).
-    readings: cache.readings.filter((r) => r.accountUuid && r.accountUuid === uuidOf.get(r.folder)),
+    readings: cache.readings.filter((r) => belongs(r, folders, orgSince)),
     health: {
       t3Logs,
       t3Entries: entryFolders.size,

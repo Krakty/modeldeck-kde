@@ -176,10 +176,19 @@ test('a page reading equal to this Mac\'s own replaces it, so the card names its
   assert.deepEqual((await d.weekly()).click, { used: 40, source: 'pool-hub', hubSource: 'Studio' });
 });
 
-test('the page sends only one-way tags, never an email or account id', async () => {
-  const body = await pageStatusBody();
+test('the page sends card names and one-way tags, never an email or account id', async () => {
+  // The long one would lose its '@' to the 64-character cut (#869 review).
+  for (const email of ['boss@example.invalid', `${'b'.repeat(64)}@example.invalid`]) {
+    const state = pageDaemonState();
+    state.accounts[1].label = email;
+    const status = JSON.parse(await pageStatusBody(state));
+    assert.deepEqual(status.usage.accounts.map((a) => a.label ?? null).sort(), ['ClickAI Skills', null], `${email.length}-character email stays home`);
+  }
+  const state = pageDaemonState();
+  state.accounts[1].label = 'boss@example.invalid';
+  const body = await pageStatusBody(state);
   const status = JSON.parse(body);
-  assert.ok(!/example\.invalid|d3c4|Click/i.test(JSON.stringify(status.usage)), 'no identity in the usage block');
+  assert.ok(!/example\.invalid|d3c4/i.test(JSON.stringify(status.usage)), 'no identity in the usage block');
   const [click] = claudeUsageTags('click@example.invalid');
   assert.ok(status.usage.accounts.some((a) => a.matches.includes(click)));
   assert.equal(status.usage.accounts.length, 2, 'an account with no readings is left out');
@@ -257,4 +266,84 @@ test('TRIPWIRE page-daemon-loop-keeps-windows: a reading only one machine holds 
   }
   const row = (await d.service.state()).usage.find((u) => u.accountId === d.accounts.click.id && u.scope === 'weekly');
   assert.deepEqual([row.source, row.hubSource], ['pool-hub', 'M5'], 'the daemon did swap in the echo, so the loop really ran');
+});
+
+// #866 review: the daemon's copy of a page reading kept the percent and source
+// but wrote detail {}, so the Fable weekly lost its "unconfirmed" flag on the way.
+test('a page reading marked unconfirmed keeps the mark on the daemon row', async (t) => {
+  const d = fixture(t);
+  const state = pageDaemonState();
+  state.usage.push({ accountId: 'p1', scope: 'Fable weekly', usedPercent: 30, resetsAt: RESET, observedAt: ago(5 * 60_000), source: 'claude-oauth-api', detail: { unconfirmed: true } });
+  d.setReply(async () => new Response(await pageStatusBody(state)));
+  await d.goRemote();
+  const click = (await d.service.state()).usage.filter((u) => u.accountId === d.accounts.click.id).map((u) => [u.scope, u.detail]);
+  assert.deepEqual(click.sort(), [['Fable weekly', { unconfirmed: true }], ['weekly', {}]]);
+});
+
+// #868 (Tim, 2026-11-21): the Mac app lists every card the page has. A card no
+// account on this Mac matches (here a Team seat) comes through read-only.
+test('TRIPWIRE every-page-card: a page card this Mac has no account for is listed read-only with its name', async (t) => {
+  const d = fixture(t);
+  const state = pageDaemonState();
+  state.accounts.push({ id: 'p4', provider: 'claude', label: 'Team Seat', enabled: true, identity: 'deck@example.invalid',
+    metadata: { claudeAccountUuid: DECK_UUID, claudeTeamOrganizationUuid: '00000000-0000-4000-8000-0000000000aa' } });
+  state.usage.push({ accountId: 'p4', scope: 'weekly', usedPercent: 30, resetsAt: RESET, observedAt: ago(2 * 60_000), source: 'claude-oauth-api', detail: {} });
+  d.setReply(async () => new Response(await pageStatusBody(state)));
+  await d.goRemote();
+  const value = await d.service.state();
+  assert.deepEqual(value.pageCards.map((c) => [c.label, c.team, c.provider, c.usage.map((u) => [u.accountId === c.id, u.scope, u.usedPercent, u.source])]),
+    [['Team Seat', true, 'claude', [[true, 'weekly', 30, 'pool-hub']]]], 'only the card no local account matches');
+  assert.ok(value.pageCards[0].id.startsWith('page:') && !value.accounts.some((a) => a.id === value.pageCards[0].id), 'never an account');
+  assert.equal(value.usage.some((u) => u.accountId === value.pageCards[0].id), false, 'its rows stay off the account usage');
+});
+
+// #869 review: two page cards listing one local tag pair with nothing, so
+// both stay listed instead of showing nowhere.
+test('page cards an account here cannot take unambiguously stay listed', async (t) => {
+  const d = fixture(t);
+  const status = JSON.parse(await pageStatusBody());
+  const click = status.usage.accounts.find((a) => a.label === 'ClickAI Skills');
+  status.usage.accounts.push({ ...click, label: 'Click Twin' });
+  d.setReply(async () => new Response(JSON.stringify(status)));
+  await d.goRemote();
+  const value = await d.service.state();
+  assert.deepEqual(value.pageCards.map((c) => c.label).sort(), ['Click Twin', 'ClickAI Skills']);
+  assert.equal(new Set(value.pageCards.map((c) => c.id)).size, 2, 'each card has its own id');
+  for (const card of value.pageCards) assert.ok(card.usage.every((u) => u.accountId === card.id));
+  assert.equal((await d.weekly()).click.used, 5, 'and neither overlays the account');
+  assert.equal((await d.weekly()).deck.used, 12, 'a unique match still overlays and is not listed');
+});
+
+// #869 review: the page cuts a long name to 64 characters, never through an
+// emoji, and the remote Mac accepts that name rather than the whole block.
+test('a long card name with an emoji reaches the remote Mac whole', async (t) => {
+  const d = fixture(t);
+  const state = pageDaemonState();
+  state.accounts[0].label = `${'a'.repeat(63)}\u{1F600}tail`;
+  const status = JSON.parse(await pageStatusBody(state));
+  const click = status.usage.accounts.find((a) => a.label?.startsWith('aaa'));
+  assert.equal(click.label, `${'a'.repeat(63)}\u{1F600}`, 'cut after the emoji, not inside it');
+  status.usage.accounts = status.usage.accounts.map((a) => (a === click ? { ...a, matches: ['f'.repeat(24)] } : a));
+  d.setReply(async () => new Response(JSON.stringify(status)));
+  await d.goRemote();
+  assert.deepEqual((await d.service.state()).pageCards.map((c) => c.label), [`${'a'.repeat(63)}\u{1F600}`]);
+});
+
+test('page-only cards go away with the page numbers', async (t) => {
+  const d = fixture(t);
+  assert.deepEqual((await d.service.state()).pageCards, [], 'a Mac that never asked the page lists none');
+});
+
+// #868, the page's rule from #864: a fresh reading hides the account's windows
+// read 6 hours or more before it; an all-old account keeps every window.
+test('a window 6 hours behind the account\'s fresh newest reading is dropped; an all-old account keeps its windows', async (t) => {
+  const d = fixture(t);
+  d.store.recordUsage(d.accounts.click.id, { scope: 'Fable weekly', usedPercent: 50, resetsAt: RESET, observedAt: ago(10 * 3_600_000), source: 'claude-oauth-api' });
+  const old = d.store.saveAccount({ provider: 'claude', label: 'Old', identity: 'old@example.invalid', profileRef: path.join(os.tmpdir(), 'modeldeck-hub-usage-old') });
+  d.store.recordUsage(old.id, { scope: 'weekly', usedPercent: 33, resetsAt: RESET, observedAt: ago(30 * 3_600_000), source: 'claude-oauth-api' });
+  d.store.recordUsage(old.id, { scope: '5-hour', usedPercent: 9, resetsAt: RESET, observedAt: ago(40 * 3_600_000), source: 'claude-oauth-api' });
+  await d.goRemote();
+  const scopes = (id) => (d.service.state().then((v) => v.usage.filter((u) => u.accountId === id).map((u) => u.scope).sort()));
+  assert.deepEqual(await scopes(d.accounts.click.id), ['weekly'], 'the page\'s fresh weekly hides the 10-hour-old Fable weekly');
+  assert.deepEqual(await scopes(old.id), ['5-hour', 'weekly'], 'nothing fresh, so nothing dropped');
 });

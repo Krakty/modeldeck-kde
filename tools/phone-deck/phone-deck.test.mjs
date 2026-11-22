@@ -918,3 +918,61 @@ test('TRIPWIRE a direct-only machine is never asked for a daemon state', async (
   assert.deepEqual(card.machines.map((m) => [m.name, m.signIn]), [['Studio', 'needed'], ['Mini agents', 'ok']]);
   assert.equal(card.signIn, null);
 });
+
+// #859 TRIPWIRE page-keeps-team-seat-apart: Tim's personal Insight plan and his
+// seat on Insight's Team plan share one email and account id. The Team folder
+// is its own card, and its match tags never pair with a personal-plan account.
+test('TRIPWIRE page-keeps-team-seat-apart: a Team seat with the same account id is its own card', async () => {
+  const { claudeUsageTags } = await import('../../src/pool-member-tag.mjs');
+  const studio = { accounts: [account('s1', { label: 'Insight', identity: 'tim@example.invalid', metadata: { claudeAccountUuid: UUID } })], usage: [] };
+  const direct = {
+    v: 1, readAt: new Date(NOW).toISOString(),
+    folders: [
+      { folder: 'insight', accountUuid: UUID, organizationUuid: 'org-personal', team: false, plan: 'Ultra', rateLimitTier: null },
+      { folder: 'insight-team', accountUuid: UUID, organizationUuid: 'org-team', team: true, plan: null, rateLimitTier: null },
+    ],
+    readings: [
+      { folder: 'insight', accountUuid: UUID, organizationUuid: 'org-personal', entry: 'claude-insight', source: 't3', scope: 'weekly', usedPercent: 10, resetsAt: '2026-10-24T12:00:00.000Z', status: 'allowed', observedAt: new Date(NOW - 60_000).toISOString() },
+      { folder: 'insight-team', accountUuid: UUID, organizationUuid: 'org-team', entry: 'claude-insight-team', source: 't3', scope: 'weekly', usedPercent: 70, resetsAt: '2026-10-25T12:00:00.000Z', status: 'allowed', observedAt: new Date(NOW - 60_000).toISOString() },
+    ],
+    health: { t3Logs: true, t3Entries: 2, conversationsLastDay: 2, withoutReadingLastDay: 0, formatWarning: false },
+  };
+  const deck = buildDeck({ Studio: listedMachine('Studio', studio, direct) }, NOW);
+  const cards = deck.accounts.filter((a) => a.provider === 'claude').map((a) => [a.label, a.windows.map((w) => [w.remaining, w.source])]);
+  assert.deepEqual(cards.sort(), [['Insight', [[90, 'Studio · T3']]], ['insight-team', [[30, 'Studio · T3']]]]);
+  // Another Mac's personal Insight account matches the personal card only.
+  const personalTags = new Set(claudeUsageTags('tim@example.invalid', UUID));
+  const owners = deck.hubUsage.accounts.filter((a) => a.matches.some((tag) => personalTags.has(tag)));
+  assert.deepEqual(owners.map((a) => a.windows[0].usedPercent), [10]);
+});
+
+// #859 review: with no ModelDeck accounts, a Team folder listed first must not
+// absorb the personal folder; and across machines a personal account with no
+// account id must not join a Team card by its label.
+test('a Team card never absorbs a personal account, by account id or by label', () => {
+  const folder = (name, org, team) => ({ folder: name, accountUuid: UUID, organizationUuid: org, team, plan: null, rateLimitTier: null });
+  const reading = (name, org, used) => ({ folder: name, accountUuid: UUID, organizationUuid: org, entry: `claude-${name}`, source: 't3', scope: 'weekly', usedPercent: used, resetsAt: '2026-10-24T12:00:00.000Z', status: 'allowed', observedAt: new Date(NOW - 60_000).toISOString() });
+  const direct = { v: 1, readAt: new Date(NOW).toISOString(), folders: [folder('a-team', 'org-team', true), folder('z-personal', 'org-personal', false)],
+    readings: [reading('a-team', 'org-team', 70), reading('z-personal', 'org-personal', 10)], health: { t3Logs: true, t3Entries: 2, conversationsLastDay: 2, withoutReadingLastDay: 0, formatWarning: false } };
+  const lone = buildDeck({ Studio: listedMachine('Studio', { accounts: [], usage: [] }, direct) }, NOW);
+  assert.deepEqual(lone.accounts.map((a) => [a.label, a.windows.map((w) => w.remaining)]).sort(), [['a-team', [30]], ['z-personal', [90]]]);
+  const teamOnly = { ...direct, folders: [folder('insight', 'org-team', true)], readings: [reading('insight', 'org-team', 70)] };
+  const cross = buildDeck({
+    Studio: listedMachine('Studio', { accounts: [], usage: [] }, teamOnly),
+    M5: machine('M5', [account('m1', { label: 'Insight' })], [usage('m1', 'weekly', 95)]),
+  }, NOW);
+  assert.deepEqual(cross.accounts.map((a) => [a.label, a.windows.map((w) => w.remaining)]).sort(), [['Insight', [95]], ['insight', [30]]]);
+});
+
+// #864 TRIPWIRE page-drops-left-behind-windows: the token check is off, so the
+// per-model Fable weekly keeps Thursday's reading while the all-models weekly
+// comes fresh from T3. The old window must not sit on the card as if current;
+// a card whose windows are all old keeps them (its age line says so).
+test('TRIPWIRE page-drops-left-behind-windows: a window far older than the card\'s newest is left off', () => {
+  const fresh = { accounts: [account('s1', { metadata: { claudeAccountUuid: UUID } })], usage: [usage('s1', 'Fable weekly', 9, 17 * 3_600_000)] };
+  const card = buildDeck({ Studio: listedMachine('Studio', fresh, directOut('probe', [[20, 60_000]])) }, NOW).accounts[0];
+  assert.deepEqual(card.windows.map((w) => w.title), ['Weekly · all models']);
+  const allOld = { accounts: [account('s1')], usage: [usage('s1', 'weekly', 63, 17 * 3_600_000), usage('s1', 'Fable weekly', 52, 24 * 3_600_000)] };
+  const old = buildDeck({ Studio: listedMachine('Studio', allOld, null) }, NOW).accounts[0];
+  assert.deepEqual(old.windows.map((w) => w.title), ['Weekly · all models', 'Weekly · Fable']);
+});

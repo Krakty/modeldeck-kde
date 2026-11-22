@@ -691,6 +691,20 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// the same percent shows a reset time. Only when NO tied window has a
     /// reset does the pick fall back to display order (5-hour first).
     public var worstWindow: DeckWindow? {
+        Self.leadWindow(
+            in: windows, provider: provider, leadWindow: leadWindow,
+            prefersGeneralWeeklyHeadline: prefersGeneralWeeklyHeadline
+        )
+    }
+
+    /// The `worstWindow` rule over any window list, so a read-only page
+    /// card (issue #868) leads with the same line an account card would.
+    public static func leadWindow(
+        in windows: [DeckWindow],
+        provider: DeckProvider?,
+        leadWindow: DeckLeadWindow,
+        prefersGeneralWeeklyHeadline: Bool
+    ) -> DeckWindow? {
         let measurable = windows.filter { $0.remainingPercent != nil }
         let rateLimits = measurable.filter { !$0.isSpend }
         var eligible = rateLimits.isEmpty ? measurable : rateLimits
@@ -875,10 +889,75 @@ public struct DeckColumn: Equatable, Identifiable, Sendable {
         return total == 1 ? "1 subscription" : "\(total) subscriptions"
     }
 
-    public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenAccountCount: Int = 0) {
+    /// Issue #868: usage-page cards this Mac has no account for, listed
+    /// read-only under the provider's own cards. Not counted as subscriptions.
+    public var pageCards: [DeckPageCardRow]
+
+    public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenAccountCount: Int = 0, pageCards: [DeckPageCardRow] = []) {
         self.provider = provider
         self.rows = rows
         self.hiddenAccountCount = hiddenAccountCount
+        self.pageCards = pageCards
+    }
+}
+
+/// Issue #868: one read-only usage-page card: its name, Team flag, windows,
+/// and the line saying where and when the page read it.
+public struct DeckPageCardRow: Equatable, Identifiable, Sendable {
+    public var id: String
+    public var label: String
+    public var team: Bool
+    public var provider: DeckProvider?
+    public var windows: [DeckWindow]
+    /// The line the collapsed card shows, picked like an account card's.
+    public var lead: DeckWindow?
+    public var sourceText: String
+
+    public init(
+        id: String, label: String, team: Bool, provider: DeckProvider? = nil,
+        windows: [DeckWindow], lead: DeckWindow? = nil, sourceText: String
+    ) {
+        self.id = id
+        self.label = label
+        self.team = team
+        self.provider = provider
+        self.windows = windows
+        self.lead = lead ?? windows.first
+        self.sourceText = sourceText
+    }
+
+    /// The deck row for a daemon page card, or nil when it has no window.
+    public static func make(
+        _ card: DeckPageCard,
+        thresholds: UsageThresholds,
+        now: Date,
+        leadWindow: DeckLeadWindow = .lowest,
+        prefersGeneralWeeklyHeadline: Bool = false
+    ) -> DeckPageCardRow? {
+        let provider = DeckProvider.from(card.provider)
+        let windows = card.usage
+            .map { DeckBuilder.window(from: $0, thresholds: thresholds, now: now) }
+            .filter { !DeckBuilder.isMeaninglessWindow($0) }
+            .sorted { lhs, rhs in
+                let l = DeckBuilder.windowRank(scope: lhs.scope)
+                let r = DeckBuilder.windowRank(scope: rhs.scope)
+                if l != r { return l < r }
+                return lhs.scope.localizedCaseInsensitiveCompare(rhs.scope) == .orderedAscending
+            }
+        guard !windows.isEmpty else { return nil }
+        let lead = DeckAccountRow.leadWindow(
+            in: windows, provider: provider, leadWindow: leadWindow,
+            prefersGeneralWeeklyHeadline: prefersGeneralWeeklyHeadline
+        )
+        let newest = card.usage.compactMap { snapshot in
+            DeckDateParsing.date(from: snapshot.observedAt).map { (at: $0, source: snapshot.hubSource) }
+        }.max { $0.at < $1.at }
+        let read = newest.map { "Read \(DeckFreshness.ageText(observedAt: $0.at, now: now))" }
+        let sourceText = ([read, newest?.source] + ["from the usage page"]).compactMap { $0 }.joined(separator: " · ")
+        return DeckPageCardRow(
+            id: card.id, label: card.label, team: card.team == true, provider: provider,
+            windows: windows, lead: lead, sourceText: sourceText
+        )
     }
 }
 
@@ -1148,7 +1227,15 @@ public enum DeckBuilder {
             if provider == .grok, providerRows.isEmpty { return nil }
             return DeckColumn(
                 provider: provider,
-                rows: sorted(providerRows, by: sortOrder, direction: direction)
+                rows: sorted(providerRows, by: sortOrder, direction: direction),
+                pageCards: state.pageCards
+                    .filter { $0.provider == provider.rawValue }
+                    .compactMap {
+                        DeckPageCardRow.make(
+                            $0, thresholds: thresholds, now: now, leadWindow: leadWindow,
+                            prefersGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
+                        )
+                    }
             )
         }
     }
@@ -1226,7 +1313,8 @@ public enum DeckBuilder {
         }
         return DeckWindow(
             scope: snapshot.scope,
-            title: windowTitle(for: snapshot.scope),
+            // Issue #866: an undocumented field's reading says so in its title.
+            title: windowTitle(for: snapshot.scope) + (snapshot.detail?.unconfirmed == true ? " (unconfirmed)" : ""),
             remainingPercent: remaining,
             resetsAt: resetDate,
             resetText: text,
@@ -1843,6 +1931,11 @@ public final class DeckPopoverModel: ObservableObject {
         layout: DeckLayout,
         now: Date = Date()
     ) -> Bool {
+        // Issue #868 (#869 review): both layouts list the usage page's
+        // cards from the columns, so a Mac with only page cards is not empty.
+        let pageCardsShown = DeckBuilder.columns(state: state, sortOrder: .lowestRemaining, now: now)
+            .contains { !$0.pageCards.isEmpty }
+        if pageCardsShown { return false }
         let rows = DeckBuilder.rows(state: state, now: now)
         switch layout {
         case .twoColumn: return rows.allSatisfy { $0.provider == nil }
@@ -3129,7 +3222,8 @@ public final class DeckPopoverModel: ObservableObject {
             return DeckColumn(
                 provider: column.provider,
                 rows: visible,
-                hiddenAccountCount: rows.count - visible.count
+                hiddenAccountCount: rows.count - visible.count,
+                pageCards: column.pageCards
             )
         }
     }
