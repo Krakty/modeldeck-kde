@@ -31,8 +31,12 @@ cat > "$UNIT" <<UNITEOF
 Description=ModelDeck KDE tray icon (Claude Code and Codex capacity left)
 PartOf=graphical-session.target
 After=graphical-session.target
+Requisite=graphical-session.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
+ExecCondition=/bin/sh -c 'test -n "\$WAYLAND_DISPLAY" || test -n "\$DISPLAY"'
 ExecStart=/usr/bin/python3 $APP/modeldeck-tray.py
 Restart=on-failure
 RestartSec=15
@@ -42,6 +46,11 @@ WantedBy=graphical-session.target
 UNITEOF
 systemctl --user daemon-reload
 systemctl --user enable modeldeck-tray.service >/dev/null 2>&1 || true
-systemctl --user restart modeldeck-tray.service
-sleep 3
-systemctl --user is-active modeldeck-tray.service
+# With no desktop session the unit is only enabled; it starts with the next Plasma login.
+if systemctl --user is-active --quiet graphical-session.target; then
+  systemctl --user restart modeldeck-tray.service
+  sleep 3
+  systemctl --user is-active modeldeck-tray.service
+else
+  echo "enabled (no desktop session now; starts at the next login)"
+fi
