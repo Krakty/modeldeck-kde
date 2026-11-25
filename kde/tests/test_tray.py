@@ -40,6 +40,14 @@ class TrayText(unittest.TestCase):
         self.assertEqual(tray.colour_for(25, config), tray.GOLD)
         self.assertEqual(tray.colour_for(10, config), tray.RED)
 
+    def test_hover_bars(self):
+        self.assertEqual(tray.text_bar(0), '\u2591' * 10)
+        self.assertEqual(tray.text_bar(100), '\u2588' * 10)
+        self.assertEqual(tray.text_bar(23), '\u2588' * 2 + '\u2591' * 8)
+        line = tray.hover_line(tray.rows(STATUS, NOW)[2])
+        self.assertTrue(line.startswith('\u2588' + '\u2591' * 9 + ' 12%  Codex (pro) weekly'))
+        self.assertEqual(tray.hover_line(tray.rows(STATUS, NOW)[3]), 'Other: sign in again')
+
     def test_no_windows_is_said(self):
         _, lines = tray.summarize({'accounts': [{'provider': 'Codex', 'windows': [], 'error': None}]}, NOW)
         self.assertEqual(lines, ['Codex: no limit windows reported'])

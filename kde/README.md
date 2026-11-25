@@ -6,8 +6,10 @@ usage readers; the macOS app and the daemon are not used.
 
 - The icon shows the lowest "% left" across every account and limit window: blue when healthy,
   gold at 25% or less, red at 10% or less, grey when the last read failed.
-- Hover for one line per window with its reset time. The right-click menu shows the same lines.
-- Left-click refreshes now. It otherwise refreshes every five minutes.
+- Hover for one text bar per limit window, with the percent left and the reset time.
+- Left-click opens a panel with a large bar per window and the percent left written inside it
+  (Esc or another click closes it).
+- Right-click to refresh now or quit. It otherwise refreshes every five minutes.
 
 ## Parts
 
